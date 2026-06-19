@@ -14,7 +14,8 @@ const ui = {
   mode: document.querySelector("#mode"),
 };
 
-let cells = new Set();
+let cells = new Map();
+let trails = new Map();
 let running = true;
 let generation = 0;
 let cellSize = Number(ui.scale.value);
@@ -140,6 +141,19 @@ function parseKey(value) {
   return { x, y };
 }
 
+function noise(x, y, seed = 0) {
+  const raw = Math.sin(x * 127.1 + y * 311.7 + seed * 74.7) * 43758.5453;
+  return raw - Math.floor(raw);
+}
+
+function blendColor(a, b, t) {
+  return a.map((value, index) => Math.round(value + (b[index] - value) * t));
+}
+
+function rgba(color, alpha) {
+  return `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${alpha})`;
+}
+
 function resize() {
   const ratio = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -159,12 +173,20 @@ function screenToCell(clientX, clientY) {
 
 function setCell(x, y, alive) {
   const id = key(x, y);
-  if (alive) cells.add(id);
-  else cells.delete(id);
+  if (alive) {
+    const age = cells.get(id) || 0;
+    cells.set(id, Math.max(1, age));
+    trails.delete(id);
+  } else {
+    const age = cells.get(id) || 1;
+    cells.delete(id);
+    trails.set(id, Math.min(1, 0.34 + age / 80));
+  }
 }
 
 function randomize() {
   cells.clear();
+  trails.clear();
   generation = 0;
   const rect = canvas.getBoundingClientRect();
   const cols = Math.ceil(rect.width / cellSize) + 8;
@@ -172,10 +194,24 @@ function randomize() {
   const density = Number(ui.density.value) / 100;
   const startX = Math.floor(-cols / 2);
   const startY = Math.floor(-rows / 2);
+  const colonyCount = Math.max(5, Math.min(16, Math.round((cols * rows) / 420)));
+  const colonies = Array.from({ length: colonyCount }, () => ({
+    x: startX + Math.random() * cols,
+    y: startY + Math.random() * rows,
+    rx: 3 + Math.random() * 8,
+    ry: 3 + Math.random() * 8,
+    strength: density * (0.75 + Math.random() * 1.65),
+  }));
 
   for (let y = startY; y < startY + rows; y += 1) {
     for (let x = startX; x < startX + cols; x += 1) {
-      if (Math.random() < density) setCell(x, y, true);
+      let chance = density * 0.018;
+      for (const colony of colonies) {
+        const dx = (x - colony.x) / colony.rx;
+        const dy = (y - colony.y) / colony.ry;
+        chance += colony.strength * Math.exp(-(dx * dx + dy * dy));
+      }
+      if (Math.random() < Math.min(0.62, chance)) setCell(x, y, true);
     }
   }
   updateStats();
@@ -203,7 +239,7 @@ function placePattern(name) {
 function step() {
   const counts = new Map();
 
-  for (const id of cells) {
+  for (const id of cells.keys()) {
     const { x, y } = parseKey(id);
     for (let dy = -1; dy <= 1; dy += 1) {
       for (let dx = -1; dx <= 1; dx += 1) {
@@ -214,14 +250,21 @@ function step() {
     }
   }
 
-  const next = new Set();
-  for (const [id, count] of counts) {
-    if (count === 3 || (count === 2 && cells.has(id))) {
-      next.add(id);
+  const next = new Map();
+  const touched = new Set([...counts.keys(), ...cells.keys()]);
+  for (const id of touched) {
+    const count = counts.get(id) || 0;
+    const age = cells.get(id) || 0;
+    if (count === 3 || (count === 2 && age > 0)) {
+      next.set(id, age > 0 ? age + 1 : 1);
+      trails.delete(id);
+    } else if (age > 0) {
+      trails.set(id, Math.min(1, 0.42 + age / 64));
     }
   }
 
   cells = next;
+  decayTrails(0.9);
   generation += 1;
   updateStats();
 }
@@ -256,29 +299,139 @@ function drawGrid(width, height) {
   ctx.stroke();
 }
 
-function drawCells(width, height) {
-  const visiblePadding = cellSize * 2;
-  ctx.fillStyle = "#53f4a7";
-  ctx.shadowColor = "rgba(83, 244, 167, 0.38)";
-  ctx.shadowBlur = Math.max(0, cellSize - 5);
+function decayTrails(amount = 0.975) {
+  for (const [id, value] of trails) {
+    const next = value * amount;
+    if (next < 0.025) trails.delete(id);
+    else trails.set(id, next);
+  }
+}
 
-  for (const id of cells) {
+function cellScreenBox(x, y) {
+  return {
+    x: pan.x + x * cellSize,
+    y: pan.y + y * cellSize,
+    centerX: pan.x + (x + 0.5) * cellSize,
+    centerY: pan.y + (y + 0.5) * cellSize,
+  };
+}
+
+function isVisible(sx, sy, width, height, padding) {
+  return sx >= -padding && sy >= -padding && sx <= width + padding && sy <= height + padding;
+}
+
+function drawTrails(width, height) {
+  const visiblePadding = cellSize * 3;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+
+  for (const [id, heat] of trails) {
     const { x, y } = parseKey(id);
-    const sx = pan.x + x * cellSize;
-    const sy = pan.y + y * cellSize;
-    if (
-      sx < -visiblePadding ||
-      sy < -visiblePadding ||
-      sx > width + visiblePadding ||
-      sy > height + visiblePadding
-    ) {
-      continue;
-    }
-    const inset = Math.max(1, Math.floor(cellSize * 0.14));
-    ctx.fillRect(sx + inset, sy + inset, cellSize - inset * 2, cellSize - inset * 2);
+    const box = cellScreenBox(x, y);
+    if (!isVisible(box.x, box.y, width, height, visiblePadding)) continue;
+
+    const radius = cellSize * (0.18 + heat * 0.42);
+    const wobble = (noise(x, y, generation * 0.02) - 0.5) * cellSize * 0.18;
+    const color = blendColor([31, 92, 122], [126, 78, 180], heat);
+    ctx.fillStyle = rgba(color, heat * 0.16);
+    ctx.beginPath();
+    ctx.ellipse(
+      box.centerX + wobble,
+      box.centerY - wobble,
+      radius * 1.24,
+      radius,
+      noise(x, y, 12) * Math.PI,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
   }
 
-  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawTissue(width, height) {
+  const visiblePadding = cellSize * 2;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round";
+
+  for (const [id, age] of cells) {
+    const { x, y } = parseKey(id);
+    const box = cellScreenBox(x, y);
+    if (!isVisible(box.x, box.y, width, height, visiblePadding)) continue;
+
+    const vitality = Math.min(1, age / 22);
+    const neighbors = [
+      [x + 1, y],
+      [x, y + 1],
+      [x + 1, y + 1],
+      [x - 1, y + 1],
+    ];
+    for (const [nx, ny] of neighbors) {
+      const neighborAge = cells.get(key(nx, ny));
+      if (!neighborAge) continue;
+      const nextBox = cellScreenBox(nx, ny);
+      const strength = Math.min(1, (age + neighborAge) / 50);
+      const color = blendColor([35, 151, 176], [88, 244, 167], strength);
+      ctx.strokeStyle = rgba(color, 0.08 + vitality * 0.16);
+      ctx.lineWidth = Math.max(1.2, cellSize * (0.18 + strength * 0.08));
+      ctx.beginPath();
+      ctx.moveTo(box.centerX, box.centerY);
+      ctx.lineTo(nextBox.centerX, nextBox.centerY);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawCells(width, height) {
+  const visiblePadding = cellSize * 2;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+
+  for (const [id, age] of cells) {
+    const { x, y } = parseKey(id);
+    const box = cellScreenBox(x, y);
+    if (!isVisible(box.x, box.y, width, height, visiblePadding)) continue;
+
+    const maturity = Math.min(1, age / 32);
+    const pulse = 0.96 + Math.sin(generation * 0.16 + x * 0.8 + y * 0.42) * 0.04;
+    const jitterX = (noise(x, y, 2) - 0.5) * cellSize * 0.12;
+    const jitterY = (noise(x, y, 7) - 0.5) * cellSize * 0.12;
+    const radius = cellSize * (0.36 + maturity * 0.12) * pulse;
+    const color = blendColor([242, 193, 92], [83, 244, 167], maturity);
+    const core = blendColor([255, 235, 180], [191, 255, 225], maturity);
+
+    ctx.fillStyle = rgba(color, 0.38);
+    ctx.beginPath();
+    ctx.ellipse(
+      box.centerX + jitterX,
+      box.centerY + jitterY,
+      radius * (1 + (noise(x, y, 9) - 0.5) * 0.28),
+      radius * (0.86 + noise(x, y, 11) * 0.22),
+      noise(x, y, 15) * Math.PI,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+
+    ctx.fillStyle = rgba(core, 0.56);
+    ctx.beginPath();
+    ctx.ellipse(
+      box.centerX + jitterX * 0.7,
+      box.centerY + jitterY * 0.7,
+      radius * 0.42,
+      radius * 0.34,
+      noise(x, y, 17) * Math.PI,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+  }
+
+  ctx.restore();
 }
 
 function draw() {
@@ -293,6 +446,8 @@ function draw() {
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, width, height);
   drawGrid(width, height);
+  drawTrails(width, height);
+  drawTissue(width, height);
   drawCells(width, height);
 }
 
@@ -302,8 +457,8 @@ function tick(now) {
   if (running && now - lastTick >= delay) {
     step();
     lastTick = now;
+    draw();
   }
-  draw();
   requestAnimationFrame(tick);
 }
 
@@ -374,6 +529,7 @@ ui.step.addEventListener("click", () => {
 ui.random.addEventListener("click", randomize);
 ui.clear.addEventListener("click", () => {
   cells.clear();
+  trails.clear();
   generation = 0;
   updateStats();
   draw();
